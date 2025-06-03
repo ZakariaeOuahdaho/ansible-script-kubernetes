@@ -14,11 +14,11 @@
         - containerd
       ignore_errors: yes
 
-    - name: " Réinitialiser kubeadm"
+    - name: "Réinitialiser kubeadm"
       shell: kubeadm reset -f
       ignore_errors: yes
 
-    - name: " Supprimer les paquets Kubernetes"
+    - name: "Supprimer les paquets Kubernetes"
       apt:
         name:
           - kubeadm
@@ -32,7 +32,7 @@
         force: yes
       ignore_errors: yes
 
-    - name: " Supprimer les dossiers Kubernetes"
+    - name: "Supprimer les dossiers Kubernetes"
       file:
         path: "{{ item }}"
         state: absent
@@ -50,7 +50,7 @@
         - /run/kubeadm
       ignore_errors: yes
 
-    - name: "🧹 Nettoyer iptables"
+    - name: "Nettoyer iptables"
       shell: |
         iptables -F
         iptables -X
@@ -63,11 +63,38 @@
         iptables -P OUTPUT ACCEPT
       ignore_errors: yes
 
-    - name: "🧹 Supprimer interfaces réseau CNI"
+    - name: "Supprimer interfaces réseau CNI"
       shell: |
         ip link delete cni0 2>/dev/null || true
         ip link delete flannel.1 2>/dev/null || true
         ip link delete docker0 2>/dev/null || true
+      ignore_errors: yes
+    - name: Stop kubelet service
+      systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: yes
+
+    - name: Kill les processus sur les ports Kubernetes
+      shell: |
+        fuser -k 6443/tcp || true
+        fuser -k 10259/tcp || true
+        fuser -k 10257/tcp || true
+      ignore_errors: yes
+
+    - name: Nettoyer les manifests et données kubelet
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes/manifests
+        - /var/lib/kubelet
+      ignore_errors: yes
+
+    - name: Démarrer kubelet
+      systemd:
+        name: kubelet
+        state: started
       ignore_errors: yes
 
     - name: Nettoyer le cache APT
@@ -142,27 +169,29 @@
         state: restarted
         enabled: yes
 
-    - name: ajout dossier pour clé kubernetes
+    - name: Ajout dossier pour clé kubernetes
       file:
         path: /etc/apt/keyrings
         state: directory
-        mode: '0755' #donner les perms pour read/write/exec
-    - name: télécharger la clé gpg kubernetes
+        mode: '0755'
+
+    - name: Télécharger la clé gpg kubernetes
       get_url:
         url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
         dest: /tmp/k8s-release.key
-        mode: '0644' # perms pour read/write
+        mode: '0644'
 
-    - name : converssion key -> gpg
-      command : gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/k8s-release.key
-      args :
-        creates : /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    - name: Conversion clé -> gpg
+      command: gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/k8s-release.key
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 
-    - name : supprimer la clé temp 
-      file : 
-        path : /tmp/k8s-release.key
-        state : absent
-    - name: ajout du depot kubernetes
+    - name: Supprimer la clé temporaire
+      file:
+        path: /tmp/k8s-release.key
+        state: absent
+
+    - name: Ajout du dépôt kubernetes
       copy:
         content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
         dest: /etc/apt/sources.list.d/kubernetes.list
@@ -189,3 +218,65 @@
         - kubelet
         - kubeadm
         - kubectl
+    - name: Stop kubelet service before init
+      systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: yes
+
+    - name: Delete existing Kubernetes manifests (old static pods)
+      file:
+        path: /etc/kubernetes/manifests
+        state: absent
+      ignore_errors: yes
+
+    - name: Clean /var/lib/kubelet (old data)
+      file:
+        path: /var/lib/kubelet
+        state: absent
+      ignore_errors: yes
+
+    - name: Start kubelet service before init
+      systemd:
+        name: kubelet
+        state: started
+      ignore_errors: yes
+
+    - name: Initialisation du cluster kubernetes master
+      shell: kubeadm init --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=all
+      args:
+        creates: /etc/kubernetes/admin.conf
+      register: kubeadm_init
+      changed_when: "'initialized successfully' in kubeadm_init.stdout"
+
+    - name: Créer le dossier .kube dans /root
+      file:
+        path: /root/.kube
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root           
+
+    - name: Copier admin.conf dans le répertoire utilisateur
+      copy: 
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Générer la commande join
+      shell: kubeadm token create --print-join-command
+      register: join_command
+
+    - name: Afficher la commande pour joindre les nœuds workers
+      debug:
+        msg: "Commande pour joindre les nœuds workers au cluster : {{ join_command.stdout }}"
+
+    - name: Sauvegarder la commande join dans join-command.yml
+      copy:
+        content: |
+          join_command: "{{ join_command.stdout }}"
+        dest: ./join-command.yml
+        mode: '0644'
