@@ -142,22 +142,42 @@
         state: restarted
         enabled: yes
 
-    - name: Ajouter la clé GPG Kubernetes
-      apt_key:
-        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
-        state: present
+    - name: ajout dossier pour clé kubernetes
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755' #donner les perms pour read/write/exec
+    - name: télécharger la clé gpg kubernetes
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+        dest: /tmp/k8s-release.key
+        mode: '0644' # perms pour read/write
 
-    - name: Ajouter le dépôt Kubernetes
-      apt_repository:
-        repo: "deb https://apt.kubernetes.io/ kubernetes-xenial main"
-        state: present
+    - name : converssion key -> gpg
+      command : gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/k8s-release.key
+      args :
+        creates : /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 
-    - name: Installer Kubernetes (version 1.26.0)
+    - name : supprimer la clé temp 
+      file : 
+        path : /tmp/k8s-release.key
+        state : absent
+    - name: ajout du depot kubernetes
+      copy:
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        mode: '0644'
+
+    - name: Mise à jour du cache apt après ajout du dépôt Kubernetes
+      apt:
+        update_cache: yes
+
+    - name: Installer Kubernetes 
       apt:
         name:
-          - kubelet=1.26.0-00
-          - kubeadm=1.26.0-00
-          - kubectl=1.26.0-00
+          - kubelet
+          - kubeadm
+          - kubectl
         state: present
         update_cache: yes
 
