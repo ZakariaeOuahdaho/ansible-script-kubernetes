@@ -1,18 +1,91 @@
 ---
-- hosts: localhost
+- name: Nettoyage et préparation d'un nœud master Kubernetes (local VM)
+  hosts: localhost
   become: yes
+  gather_facts: no 
   tasks:
-    - name: Update and upgrade system packages
+
+    - name: "Arrêter les services Kubernetes"
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - kubelet
+        - containerd
+      ignore_errors: yes
+
+    - name: " Réinitialiser kubeadm"
+      shell: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: " Supprimer les paquets Kubernetes"
+      apt:
+        name:
+          - kubeadm
+          - kubectl
+          - kubelet
+          - kubernetes-cni
+          - kube*
+        state: absent
+        purge: yes
+        autoremove: yes
+        force: yes
+      ignore_errors: yes
+
+    - name: " Supprimer les dossiers Kubernetes"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /opt/cni/bin
+        - /etc/kubernetes
+        - /root/.kube
+        - /var/lib/kubelet
+        - /var/lib/etcd
+        - /etc/cni
+        - /var/lib/cni
+        - /run/flannel
+        - /etc/flannel
+        - /var/run/kubernetes
+        - /run/kubeadm
+      ignore_errors: yes
+
+    - name: "🧹 Nettoyer iptables"
+      shell: |
+        iptables -F
+        iptables -X
+        iptables -t nat -F
+        iptables -t nat -X
+        iptables -t mangle -F
+        iptables -t mangle -X
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+      ignore_errors: yes
+
+    - name: "🧹 Supprimer interfaces réseau CNI"
+      shell: |
+        ip link delete cni0 2>/dev/null || true
+        ip link delete flannel.1 2>/dev/null || true
+        ip link delete docker0 2>/dev/null || true
+      ignore_errors: yes
+
+    - name: Nettoyer le cache APT
+      apt:
+        autoclean: yes
+        autoremove: yes
+
+    - name: Mise à jour du système
       apt:
         update_cache: yes
         upgrade: dist
 
-    - name: Install Docker
+    - name: Installer Docker
       apt:
         name: docker.io
         state: present
 
-    - name: 2. Installation des paquets requis
+    - name: Installer dépendances de Kubernetes
       apt:
         name:
           - apt-transport-https
@@ -23,12 +96,12 @@
           - software-properties-common
         state: present
 
-    - name: Disable swap
+    - name: Désactiver le swap
       shell: |
         swapoff -a
         sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 
-    - name: 4. Charger les modules kernel
+    - name: Charger modules kernel
       modprobe:
         name: "{{ item }}"
         state: present
@@ -36,7 +109,7 @@
         - overlay
         - br_netfilter
 
-    - name: 5. Configuration sysctl pour Kubernetes
+    - name: Appliquer les paramètres sysctl
       sysctl:
         name: "{{ item.key }}"
         value: "{{ item.value }}"
@@ -48,38 +121,38 @@
         - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
         - { key: 'net.ipv4.ip_forward', value: '1' }
 
-    - name: 6. Installer containerd
+    - name: Installer containerd
       apt:
         name: containerd
         state: present
 
-    - name: 7. Créer le dossier containerd
+    - name: Créer le répertoire containerd
       file:
         path: /etc/containerd
         state: directory
 
-    - name: 8. Configurer containerd
+    - name: Générer la configuration containerd
       shell: |
         containerd config default > /etc/containerd/config.toml
         sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
 
-    - name: 9. Redémarrer containerd
+    - name: Redémarrer containerd
       systemd:
         name: containerd
         state: restarted
         enabled: yes
 
-    - name: 10. Ajouter la clé GPG Kubernetes
+    - name: Ajouter la clé GPG Kubernetes
       apt_key:
         url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
         state: present
 
-    - name: 11. Ajouter le repository Kubernetes
+    - name: Ajouter le dépôt Kubernetes
       apt_repository:
         repo: "deb https://apt.kubernetes.io/ kubernetes-xenial main"
         state: present
 
-    - name: 12. Installer les outils Kubernetes
+    - name: Installer Kubernetes (version 1.26.0)
       apt:
         name:
           - kubelet=1.26.0-00
@@ -88,20 +161,11 @@
         state: present
         update_cache: yes
 
-    - name: 13. Bloquer les mises à jour auto
+    - name: Bloquer les mises à jour automatiques
       dpkg_selections:
         name: "{{ item }}"
         selection: hold
       loop:
         - kubelet
         - kubeadm
-        - kubectl
-
-    - name: Install kubeadm, kubelet, kubectl
-      apt:
-        name: "{{ item }}"
-        state: present
-      loop:
-        - kubeadm
-        - kubelet
         - kubectl
