@@ -266,6 +266,11 @@
         group: root
         mode: '0600'
 
+    - name: installer flannel CNI
+      shell: kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+      environment:
+        KUBECONFIG: /root/.kube/config
+
     - name: Générer la commande join
       shell: kubeadm token create --print-join-command
       register: join_command
