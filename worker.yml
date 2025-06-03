@@ -1,0 +1,139 @@
+---
+- name: Préparation d'un nœud worker Kubernetes
+  hosts: workers
+  become: yes
+  gather_facts: yes
+
+  vars_files:
+    - ./join-command.yml   # Contient la variable join_command
+
+  tasks:
+    - name: Mettre à jour les paquets et installer dépendances système
+      apt:
+        update_cache: yes
+        upgrade: dist
+        name:
+          - curl
+          - apt-transport-https
+          - ca-certificates
+          - software-properties-common
+        state: present
+
+    - name: Ajouter la clé GPG Docker
+      ansible.builtin.apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        keyring: /usr/share/keyrings/docker-archive-keyring.gpg
+        state: present
+
+    - name: Ajouter le dépôt Docker officiel
+      ansible.builtin.apt_repository:
+        repo: "deb [arch={{ ansible_architecture }} signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable"
+        state: present
+
+    - name: Installer Docker et containerd
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Désactiver swap
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+    - name: Charger modules kernel pour containerd
+      copy:
+        dest: /etc/modules-load.d/containerd.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: '0644'
+
+    - name: Activer modules kernel overlay et br_netfilter
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Appliquer les paramètres sysctl Kubernetes
+      copy:
+        dest: /etc/sysctl.d/kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+        mode: '0644'
+
+    - name: Appliquer sysctl
+      command: sysctl --system
+
+    - name: Configurer containerd pour utiliser systemd cgroup driver
+      shell: |
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Redémarrer et activer containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+    - name: Ajouter dépôt Kubernetes
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /"
+        mode: '0644'
+
+    - name: Télécharger la clé GPG Kubernetes
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key
+        dest: /tmp/k8s-release.key
+        mode: '0644'
+
+    - name: Convertir clé en gpg et déplacer
+      command: gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/k8s-release.key
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Supprimer clé temporaire
+      file:
+        path: /tmp/k8s-release.key
+        state: absent
+
+    - name: Mettre à jour cache apt après ajout du dépôt Kubernetes
+      apt:
+        update_cache: yes
+
+    - name: Installer kubelet, kubeadm, kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Bloquer mises à jour automatiques kube*
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: hold
+
+    - name: Joindre le nœud worker au cluster Kubernetes
+      shell: "{{ join_command }}"
+      args:
+        warn: false
+      register: join_result
+      failed_when: "'This node has joined' not in join_result.stdout and join_result.rc != 0"
+
+    - name: Afficher résultat join
+      debug:
+        var: join_result.stdout
