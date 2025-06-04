@@ -1,0 +1,20 @@
+---
+- name: Vérification rapide du cluster
+  hosts: localhost
+  become: yes
+  gather_facts: no
+
+  tasks:
+    - name: Afficher tous les nœuds
+      shell: |
+        echo "=== NODES ==="
+        kubectl get nodes
+        echo -e "\n=== NODES DETAILS ==="
+        kubectl describe nodes | grep -E "Name:|Roles:|Status:|Ready"
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: check_result
+
+    - name: Résultat
+      debug:
+        var: check_result.stdout_lines

@@ -1,58 +1,109 @@
 ---
-- name: Préparation d'un nœud worker Kubernetes
+- name: Configuration et ajout des workers au cluster Kubernetes
   hosts: workers
   become: yes
   gather_facts: yes
-
-  vars_files:
-    - ./join-command.yml   # Contient la variable join_command
+  vars:
+    join_command_file: "./join-command.yml"
 
   tasks:
-    - name: Mettre à jour les paquets et installer dépendances système
+    - name: "Arrêter les services Kubernetes existants"
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - kubelet
+        - containerd
+      ignore_errors: yes
+
+    - name: "Réinitialiser kubeadm si déjà configuré"
+      shell: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: "Supprimer les anciens paquets Kubernetes"
+      apt:
+        name:
+          - kubeadm
+          - kubectl
+          - kubelet
+          - kubernetes-cni
+          - kube*
+        state: absent
+        purge: yes
+        autoremove: yes
+        force: yes
+      ignore_errors: yes
+
+    - name: "Supprimer les dossiers Kubernetes"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /opt/cni/bin
+        - /etc/kubernetes
+        - /root/.kube
+        - /var/lib/kubelet
+        - /var/lib/etcd
+        - /etc/cni
+        - /var/lib/cni
+        - /run/flannel
+        - /etc/flannel
+        - /var/run/kubernetes
+        - /run/kubeadm
+      ignore_errors: yes
+
+    - name: "Nettoyer iptables"
+      shell: |
+        iptables -F
+        iptables -X
+        iptables -t nat -F
+        iptables -t nat -X
+        iptables -t mangle -F
+        iptables -t mangle -X
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+      ignore_errors: yes
+
+    - name: "Supprimer interfaces réseau CNI"
+      shell: |
+        ip link delete cni0 2>/dev/null || true
+        ip link delete flannel.1 2>/dev/null || true
+        ip link delete docker0 2>/dev/null || true
+      ignore_errors: yes
+
+    - name: "Nettoyer le cache APT"
+      apt:
+        autoclean: yes
+        autoremove: yes
+
+    - name: "Mise à jour du système"
       apt:
         update_cache: yes
         upgrade: dist
+
+    - name: "Installer Docker"
+      apt:
+        name: docker.io
+        state: present
+
+    - name: "Installer dépendances de Kubernetes"
+      apt:
         name:
-          - curl
           - apt-transport-https
           - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
           - software-properties-common
         state: present
 
-    - name: Ajouter la clé GPG Docker
-      ansible.builtin.apt_key:
-        url: https://download.docker.com/linux/ubuntu/gpg
-        keyring: /usr/share/keyrings/docker-archive-keyring.gpg
-        state: present
-
-    - name: Ajouter le dépôt Docker officiel
-      ansible.builtin.apt_repository:
-        repo: "deb [arch={{ ansible_architecture }} signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable"
-        state: present
-
-    - name: Installer Docker et containerd
-      apt:
-        name:
-          - docker-ce
-          - docker-ce-cli
-          - containerd.io
-        state: present
-        update_cache: yes
-
-    - name: Désactiver swap
+    - name: "Désactiver le swap"
       shell: |
         swapoff -a
         sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 
-    - name: Charger modules kernel pour containerd
-      copy:
-        dest: /etc/modules-load.d/containerd.conf
-        content: |
-          overlay
-          br_netfilter
-        mode: '0644'
-
-    - name: Activer modules kernel overlay et br_netfilter
+    - name: "Charger modules kernel"
       modprobe:
         name: "{{ item }}"
         state: present
@@ -60,80 +111,143 @@
         - overlay
         - br_netfilter
 
-    - name: Appliquer les paramètres sysctl Kubernetes
-      copy:
-        dest: /etc/sysctl.d/kubernetes.conf
-        content: |
-          net.bridge.bridge-nf-call-ip6tables = 1
-          net.bridge.bridge-nf-call-iptables = 1
-          net.ipv4.ip_forward = 1
-        mode: '0644'
+    - name: "Appliquer les paramètres sysctl"
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+        sysctl_file: /etc/sysctl.d/k8s.conf
+      loop:
+        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { key: 'net.ipv4.ip_forward', value: '1' }
 
-    - name: Appliquer sysctl
-      command: sysctl --system
+    - name: "Installer containerd"
+      apt:
+        name: containerd
+        state: present
 
-    - name: Configurer containerd pour utiliser systemd cgroup driver
+    - name: "Créer le répertoire containerd"
+      file:
+        path: /etc/containerd
+        state: directory
+
+    - name: "Générer la configuration containerd"
       shell: |
         containerd config default > /etc/containerd/config.toml
         sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
-      args:
-        creates: /etc/containerd/config.toml
 
-    - name: Redémarrer et activer containerd
+    - name: "Redémarrer containerd"
       systemd:
         name: containerd
         state: restarted
         enabled: yes
 
-    - name: Ajouter dépôt Kubernetes
-      copy:
-        dest: /etc/apt/sources.list.d/kubernetes.list
-        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /"
-        mode: '0644'
+    - name: "Ajout dossier pour clé kubernetes"
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
 
-    - name: Télécharger la clé GPG Kubernetes
+    - name: "Télécharger la clé gpg kubernetes"
       get_url:
-        url: https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key
+        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
         dest: /tmp/k8s-release.key
         mode: '0644'
 
-    - name: Convertir clé en gpg et déplacer
+    - name: "Conversion clé -> gpg"
       command: gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/k8s-release.key
       args:
         creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 
-    - name: Supprimer clé temporaire
+    - name: "Supprimer la clé temporaire"
       file:
         path: /tmp/k8s-release.key
         state: absent
 
-    - name: Mettre à jour cache apt après ajout du dépôt Kubernetes
+    - name: "Ajout du dépôt kubernetes"
+      copy:
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        mode: '0644'
+
+    - name: "Mise à jour du cache apt après ajout du dépôt Kubernetes"
       apt:
         update_cache: yes
 
-    - name: Installer kubelet, kubeadm, kubectl
+    - name: "Installer Kubernetes"
       apt:
         name:
           - kubelet
           - kubeadm
           - kubectl
         state: present
+        update_cache: yes
 
-    - name: Bloquer mises à jour automatiques kube*
-      apt:
-        name:
-          - kubelet
-          - kubeadm
-          - kubectl
-        state: hold
+    - name: "Bloquer les mises à jour automatiques"
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
 
-    - name: Joindre le nœud worker au cluster Kubernetes
+    - name: "Charger la commande join depuis le fichier"
+      include_vars: "{{ join_command_file }}"
+      delegate_to: localhost
+
+    - name: "Joindre le worker au cluster"
       shell: "{{ join_command }}"
-      args:
-        warn: false
       register: join_result
-      failed_when: "'This node has joined' not in join_result.stdout and join_result.rc != 0"
 
-    - name: Afficher résultat join
+    - name: "Vérifier la présence de kubelet.conf"
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: "Afficher résultat présence kubelet.conf"
       debug:
-        var: join_result.stdout
+        var: kubelet_conf.stat.exists
+
+    - name: "Afficher le résultat de la jointure"
+      debug:
+        msg: "Worker {{ inventory_hostname }} ajouté au cluster avec succès!"
+      when: join_result.rc == 0
+
+    - name: "Activer et démarrer kubelet"
+      systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    - name: "Attendre que le nœud soit prêt"
+      pause:
+        seconds: 60
+
+- name: Vérifier l'état des workers depuis le master
+  hosts: localhost
+  become: yes
+  gather_facts: no
+
+  tasks:
+    - name: "Vérifier l'état de tous les nœuds"
+      shell: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: nodes_status
+
+    - name: "Afficher l'état du cluster"
+      debug:
+        var: nodes_status.stdout_lines
+
+    - name: "Vérifier les pods système"
+      shell: kubectl get pods -n kube-system -o wide
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: pods_status
+
+    - name: "Afficher l'état des pods système"
+      debug:
+        var: pods_status.stdout_lines
