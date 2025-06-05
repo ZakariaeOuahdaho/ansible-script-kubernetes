@@ -1,0 +1,291 @@
+---
+- name: Installation de Rook-Ceph et Kubeflow sur cluster Kubernetes
+  hosts: localhost
+  become: yes
+  gather_facts: no
+
+  vars:
+    rook_version: "v1.12.9"
+    kubeflow_version: "v1.7.0"
+    kubeflow_manifest_repo: "https://github.com/kubeflow/manifests.git"
+
+  tasks:
+
+    - name: Vérifier que le cluster Kubernetes est prêt
+      shell: kubectl get nodes
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: cluster_status
+      failed_when: cluster_status.rc != 0
+
+    - name: Afficher l'état du cluster
+      debug:
+        var: cluster_status.stdout_lines
+
+    - name: Installer Git (requis pour Kubeflow)
+      apt:
+        name: git
+        state: present
+
+    ###############################################
+    # NETTOYAGE DES INSTALLATIONS PRÉCÉDENTES
+    ###############################################
+
+    - name: Nettoyer l'ancienne installation de Kubeflow (manifests uniquement)
+      file:
+        path: /opt/kubeflow-deployment/manifests
+        state: absent
+
+    - name: Supprimer les anciens fichiers Rook-Ceph
+      file:
+        path: /opt/kubeflow-deployment
+        state: absent
+
+    - name: Supprimer les CRDs Kubeflow si existants (sans supprimer les données)
+      shell: |
+        kubectl delete -f https://raw.githubusercontent.com/kubeflow/manifests/{{ kubeflow_version }}/example -n kubeflow --ignore-not-found
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+
+    - name: Supprimer les CRDs Rook-Ceph si existants (sans supprimer les volumes)
+      shell: |
+        kubectl delete -f /opt/kubeflow-deployment/crds.yaml --ignore-not-found || true
+        kubectl delete -f /opt/kubeflow-deployment/common.yaml --ignore-not-found || true
+        kubectl delete -f /opt/kubeflow-deployment/operator.yaml --ignore-not-found || true
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+
+    - name: Créer le répertoire de travail
+      file:
+        path: /opt/kubeflow-deployment
+        state: directory
+        mode: '0755'
+
+
+    ###############################################
+    # INSTALLATION DE ROOK-CEPH
+    ###############################################
+
+    - name: Créer le namespace rook-ceph
+      shell: |
+        kubectl create namespace rook-ceph --dry-run=client -o yaml | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+
+    - name: Télécharger les manifests Rook-Ceph
+      get_url:
+        url: "https://raw.githubusercontent.com/rook/rook/{{ rook_version }}/deploy/examples/{{ item }}"
+        dest: "/opt/kubeflow-deployment/{{ item }}"
+        mode: '0644'
+      loop:
+        - crds.yaml
+        - common.yaml
+        - operator.yaml
+
+    - name: Appliquer les CRDs Rook
+      shell: kubectl apply -f /opt/kubeflow-deployment/crds.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Appliquer la configuration commune Rook
+      shell: kubectl apply -f /opt/kubeflow-deployment/common.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Déployer l'opérateur Rook
+      shell: kubectl apply -f /opt/kubeflow-deployment/operator.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Attendre que l'opérateur Rook soit prêt
+      shell: kubectl wait --for=condition=Ready pod -l app=rook-ceph-operator -n rook-ceph --timeout=300s
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Télécharger la configuration du cluster Ceph
+      get_url:
+        url: "https://raw.githubusercontent.com/rook/rook/{{ rook_version }}/deploy/examples/cluster.yaml"
+        dest: "/opt/kubeflow-deployment/cluster.yaml"
+        mode: '0644'
+    - name: Modifier la configuration Ceph pour un seul nœud
+      replace:
+        path: /opt/kubeflow-deployment/cluster.yaml
+        regexp: 'allowUnsupported: false'
+        replace: 'allowUnsupported: true'
+
+    - name: Autoriser plusieurs MONs par nœud (Ceph)
+      replace:
+        path: /opt/kubeflow-deployment/cluster.yaml
+        regexp: 'mon:\n    count: 3'
+        replace: 'mon:\n    count: 3\n    allowMultiplePerNode: true'
+
+    - name: Déployer le cluster Ceph
+      shell: kubectl apply -f /opt/kubeflow-deployment/cluster.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Attendre que le cluster Ceph soit prêt
+      shell: kubectl wait --for=condition=Ready pod -l app=rook-ceph-mon -n rook-ceph --timeout=600s
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+
+    - name: Télécharger la configuration StorageClass
+      get_url:
+        url: "https://raw.githubusercontent.com/rook/rook/{{ rook_version }}/deploy/examples/csi/rbd/storageclass.yaml"
+        dest: "/opt/kubeflow-deployment/storageclass.yaml"
+        mode: '0644'
+
+    - name: Créer la StorageClass Ceph RBD
+      shell: kubectl apply -f /opt/kubeflow-deployment/storageclass.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Définir la StorageClass par défaut
+      shell: >
+        kubectl patch storageclass rook-ceph-block -p
+        '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    ###############################################
+    # INSTALLATION DE KUBEFLOW
+    ###############################################
+
+    - name: Installer Kustomize
+      shell: |
+        curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+        mv kustomize /usr/local/bin/
+      args:
+        creates: /usr/local/bin/kustomize
+
+    - name: Cloner le dépôt Kubeflow manifests
+      git:
+        repo: "{{ kubeflow_manifest_repo }}"
+        dest: "/opt/kubeflow-deployment/manifests"
+        version: "{{ kubeflow_version }}"
+        force: yes
+
+    - name: Installer les CRDs Kubeflow
+      shell: |
+        cd /opt/kubeflow-deployment/manifests
+        while ! kustomize build example | kubectl apply -f -; do echo "Retrying..."; sleep 10; done
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: kubeflow_install
+      retries: 3
+      delay: 30
+
+    - name: Attendre que tous les pods Kubeflow soient prêts
+      shell: |
+        kubectl wait --for=condition=Ready pod --all -n kubeflow --timeout=1200s
+        kubectl wait --for=condition=Ready pod --all -n istio-system --timeout=600s
+        kubectl wait --for=condition=Ready pod --all -n auth --timeout=600s
+        kubectl wait --for=condition=Ready pod --all -n cert-manager --timeout=600s
+        kubectl wait --for=condition=Ready pod --all -n knative-eventing --timeout=600s
+        kubectl wait --for=condition=Ready pod --all -n knative-serving --timeout=600s
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+
+    - name: Configurer l'accès externe à Kubeflow (NodePort)
+      shell: kubectl patch service istio-ingressgateway -n istio-system -p '{"spec":{"type":"NodePort"}}'
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Obtenir l'URL d'accès Kubeflow
+      shell: |
+        NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+        NODE_PORT=$(kubectl get svc istio-ingressgateway -n istio-system -o jsonpath='{.spec.ports[?(@.name=="http2")].nodePort}')
+        echo "http://${NODE_IP}:${NODE_PORT}"
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: kubeflow_url
+
+    - name: Créer un utilisateur par défaut pour Kubeflow
+      shell: |
+        kubectl apply -f - <<EOF
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: user-password
+          namespace: auth
+        type: Opaque
+        data:
+          password: $(echo -n "kubeflow123" | base64)
+        ---
+        apiVersion: kubeflow.org/v1beta1
+        kind: Profile
+        metadata:
+          name: kubeflow-user-example-com
+        spec:
+          owner:
+            kind: User
+            name: user@example.com
+        EOF
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+
+    ###############################################
+    # VÉRIFICATIONS ET RAPPORT
+    ###############################################
+
+    - name: Vérifier l'état de Rook-Ceph
+      shell: kubectl get pods -n rook-ceph
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: rook_status
+
+    - name: Vérifier l'état de Kubeflow
+      shell: kubectl get pods -n kubeflow
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: kubeflow_status
+
+    - name: Vérifier les StorageClasses
+      shell: kubectl get storageclass
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: storage_status
+
+    - name: Afficher l'état de Rook-Ceph
+      debug:
+        var: rook_status.stdout_lines
+
+    - name: Afficher l'état de Kubeflow
+      debug:
+        var: kubeflow_status.stdout_lines
+
+    - name: Afficher les StorageClasses
+      debug:
+        var: storage_status.stdout_lines
+
+    - name: Afficher l'URL d'accès à Kubeflow
+      debug:
+        msg: |
+          ============================================
+          🎉 INSTALLATION TERMINÉE !
+          ============================================
+          Kubeflow URL : {{ kubeflow_url.stdout }}
+          Email : user@example.com
+          Mot de passe : kubeflow123
+          ============================================
+
+    - name: Sauvegarder les informations d'accès
+      copy:
+        content: |
+          # Kubeflow Access Info
+          URL: {{ kubeflow_url.stdout }}
+          Email: user@example.com
+          Password: kubeflow123
+
+          # Commandes utiles
+          kubectl get pods -n rook-ceph
+          kubectl get pods -n kubeflow
+          kubectl get storageclass
+        dest: ./kubeflow-access-info.txt
+        mode: '0644'

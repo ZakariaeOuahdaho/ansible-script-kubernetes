@@ -266,6 +266,24 @@
         group: root
         mode: '0600'
 
+    - name: Créer le dossier .kube dans /home/user
+      file:
+        path: /home/zk/.kube
+        state: directory
+        mode: '0700'
+        owner: zk
+        group: zk
+
+    - name: Copier admin.conf dans le répertoire utilisateur zk
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/zk/.kube/config
+        remote_src: yes
+        owner: zk
+        group: zk
+        mode: '0600'
+
+
     - name: installer flannel CNI
       shell: kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
       environment:
