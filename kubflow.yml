@@ -1,19 +1,17 @@
 ---
-- name: Installation de Rook-Ceph et Kubeflow sur cluster Kubernetes
+- name: Installation de Kubeflow sur cluster Kubernetes
   hosts: localhost
   become: yes
   gather_facts: no
 
   vars:
-    rook_version: "v1.12.9"
     kubeflow_version: "v1.7.0"
-    kubeflow_manifest_repo: "https://github.com/kubeflow/manifests.git"
+    workdir: "/opt/kubeflow-install"
     kubeconfig_path: "/root/.kube/config"
-    workdir: "/opt/kubeflow-deployment"
 
   tasks:
 
-    - name: Vérifier que le cluster Kubernetes est prêt
+    - name: Vérifier que le cluster Kubernetes est opérationnel
       shell: kubectl get nodes
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
@@ -24,33 +22,22 @@
       debug:
         var: cluster_status.stdout_lines
 
-    - name: Installer git et curl
+    - name: Installer les dépendances nécessaires
       apt:
-        name: 
+        name:
           - git
           - curl
+          - wget
         state: present
-      update_cache: yes
+        update_cache: yes
 
-    - name: Nettoyer ancienne installation Kubeflow (manifests)
-      file:
-        path: "{{ workdir }}/manifests"
-        state: absent
-
-    - name: Supprimer anciens fichiers Rook-Ceph
+    - name: Créer le répertoire de travail
       file:
         path: "{{ workdir }}"
-        state: absent
+        state: directory
+        mode: '0755'
 
-    # Suppression propre des CRDs avec vérification d'existence
-    - name: Vérifier si les CRDs Kubeflow existent
-      shell: kubectl get crd | grep -i kubeflow || true
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      register: kubeflow_crds_exist
-      ignore_errors: yes
-
-    - name: Supprimer CRDs Kubeflow si existants
+    - name: Nettoyer ancienne installation Kubeflow
       shell: |
         kubectl delete namespace kubeflow --ignore-not-found=true
         kubectl delete namespace istio-system --ignore-not-found=true
@@ -60,197 +47,47 @@
         kubectl delete namespace auth --ignore-not-found=true
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
-      when: kubeflow_crds_exist.stdout != ""
       ignore_errors: yes
 
-    - name: Supprimer namespace et ressources Rook-Ceph si existants
+    - name: Attendre la suppression des namespaces
       shell: |
-        kubectl delete namespace rook-ceph --ignore-not-found=true
-        kubectl get crd | grep rook | awk '{print $1}' | xargs -r kubectl delete crd --ignore-not-found=true
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      ignore_errors: yes
-
-    - name: Attendre la suppression complète des namespaces
-      shell: |
-        while kubectl get namespace rook-ceph 2>/dev/null; do
-          echo "Attente suppression namespace rook-ceph..."
+        while kubectl get namespace kubeflow 2>/dev/null; do
+          echo "Attente suppression namespace kubeflow..."
           sleep 5
         done
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
       ignore_errors: yes
 
-    - name: Créer répertoire de travail
-      file:
-        path: "{{ workdir }}"
-        state: directory
-        mode: '0755'
-
-    # --- Installation Rook-Ceph ---
-
-    - name: Créer namespace rook-ceph
-      kubernetes.core.k8s:
-        name: rook-ceph
-        api_version: v1
-        kind: Namespace
-        state: present
-        kubeconfig: "{{ kubeconfig_path }}"
-
-    - name: Télécharger manifests Rook-Ceph
-      get_url:
-        url: "https://raw.githubusercontent.com/rook/rook/{{ rook_version }}/deploy/examples/{{ item }}"
-        dest: "{{ workdir }}/{{ item }}"
-        mode: '0644'
-        timeout: 30
-      loop:
-        - crds.yaml
-        - common.yaml
-        - operator.yaml
-      retries: 3
-      delay: 5
-
-    - name: Appliquer CRDs Rook
-      shell: kubectl apply -f {{ workdir }}/crds.yaml
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      register: apply_crds
-      until: apply_crds.rc == 0
-      retries: 3
-      delay: 10
-
-    - name: Attendre que les CRDs soient établis
-      shell: kubectl wait --for condition=established --timeout=60s crd/cephclusters.ceph.rook.io
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Appliquer configuration commune Rook
-      shell: kubectl apply -f {{ workdir }}/common.yaml
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Déployer opérateur Rook
-      shell: kubectl apply -f {{ workdir }}/operator.yaml
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Attendre que l'opérateur Rook soit prêt
-      shell: kubectl wait --for=condition=Ready pod -l app=rook-ceph-operator -n rook-ceph --timeout=300s
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      register: operator_ready
-      until: operator_ready.rc == 0
-      retries: 3
-      delay: 30
-
-    - name: Télécharger configuration cluster Ceph
-      get_url:
-        url: "https://raw.githubusercontent.com/rook/rook/{{ rook_version }}/deploy/examples/cluster.yaml"
-        dest: "{{ workdir }}/cluster.yaml"
-        mode: '0644'
-        timeout: 30
-
-    - name: Modifier allowUnsupported dans cluster.yaml
-      replace:
-        path: "{{ workdir }}/cluster.yaml"
-        regexp: 'allowUnsupported: false'
-        replace: 'allowUnsupported: true'
-
-    - name: Configurer les MONs pour environnement de test
-      replace:
-        path: "{{ workdir }}/cluster.yaml"
-        regexp: '(\s+)count: 3'
-        replace: '\1count: 1\n\1allowMultiplePerNode: true'
-
-    - name: Configurer les OSDs pour environnement de test
-      replace:
-        path: "{{ workdir }}/cluster.yaml"
-        regexp: '(\s+)useAllNodes: true'
-        replace: '\1useAllNodes: true\n\1useAllDevices: false\n\1config:\n\1  osdsPerDevice: "1"'
-
-    - name: Déployer cluster Ceph
-      shell: kubectl apply -f {{ workdir }}/cluster.yaml
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Attendre le déploiement des MONs Ceph
-      shell: |
-        for i in {1..20}; do
-          if kubectl get pods -n rook-ceph | grep rook-ceph-mon | grep Running; then
-            echo "MONs déployés avec succès"
-            exit 0
-          fi
-          echo "Attente des MONs... (tentative $i/20)"
-          sleep 30
-        done
-        echo "Timeout: Les MONs ne sont pas prêts après 10 minutes"
-        kubectl get pods -n rook-ceph
-        exit 1
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Télécharger configuration StorageClass Ceph RBD
-      get_url:
-        url: "https://raw.githubusercontent.com/rook/rook/{{ rook_version }}/deploy/examples/csi/rbd/storageclass.yaml"
-        dest: "{{ workdir }}/storageclass.yaml"
-        mode: '0644'
-        timeout: 30
-
-    - name: Créer StorageClass Ceph RBD
-      shell: kubectl apply -f {{ workdir }}/storageclass.yaml
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Attendre que la StorageClass soit disponible
-      shell: kubectl get storageclass rook-ceph-block
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      register: sc_ready
-      until: sc_ready.rc == 0
-      retries: 5
-      delay: 10
-
-    - name: Définir StorageClass par défaut
-      shell: >
-        kubectl patch storageclass rook-ceph-block -p
-        '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    # --- Installation Kustomize ---
-
-    - name: Vérifier si kustomize est déjà installé
+    - name: Vérifier si kustomize est installé
       command: which kustomize
-      register: kustomize_installed
+      register: kustomize_check
       ignore_errors: yes
 
-    - name: Installer kustomize si nécessaire
+    - name: Installer kustomize
       shell: |
         cd /tmp
         curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
         chmod +x kustomize
         mv kustomize /usr/local/bin/
-      when: kustomize_installed.rc != 0
+      when: kustomize_check.rc != 0
 
-    # --- Installation Kubeflow ---
-
-    - name: Cloner dépôt Kubeflow manifests
+    - name: Cloner le dépôt Kubeflow manifests
       git:
-        repo: "{{ kubeflow_manifest_repo }}"
+        repo: "https://github.com/kubeflow/manifests.git"
         dest: "{{ workdir }}/manifests"
         version: "{{ kubeflow_version }}"
         force: yes
-        depth: 1  # Clone shallow pour économiser du temps
 
-    - name: Installer les CRDs Kubeflow en premier
+    - name: Installer cert-manager
       shell: |
         cd {{ workdir }}/manifests
         kustomize build common/cert-manager/cert-manager/base | kubectl apply -f -
         kubectl wait --for condition=established --timeout=60s crd/certificates.cert-manager.io
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
-      register: cert_manager_install
-      until: cert_manager_install.rc == 0
+      register: cert_manager_result
+      until: cert_manager_result.rc == 0
       retries: 3
       delay: 30
 
@@ -273,96 +110,112 @@
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
 
-    - name: Installer les composants Kubeflow par étapes
+    - name: Installer Dex (Auth)
       shell: |
         cd {{ workdir }}/manifests
-        
-        # Dex (Auth)
         kustomize build common/dex/overlays/istio | kubectl apply -f -
-        
-        # OIDC AuthService
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Installer OIDC AuthService
+      shell: |
+        cd {{ workdir }}/manifests
         kustomize build common/oidc-authservice/base | kubectl apply -f -
-        
-        # Knative
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Installer Knative
+      shell: |
+        cd {{ workdir }}/manifests
         kustomize build common/knative/knative-serving/overlays/gateways | kubectl apply -f -
         kustomize build common/knative/knative-eventing/base | kubectl apply -f -
-        
-        # Kubeflow Namespace
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Installer les ressources Kubeflow de base
+      shell: |
+        cd {{ workdir }}/manifests
         kustomize build common/kubeflow-namespace/base | kubectl apply -f -
-        
-        # Kubeflow Roles
         kustomize build common/kubeflow-roles/base | kubectl apply -f -
-        
-        # Kubeflow Istio Resources
         kustomize build common/istio-1-16/kubeflow-istio-resources/base | kubectl apply -f -
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
-      register: kubeflow_base_install
-      until: kubeflow_base_install.rc == 0
-      retries: 2
-      delay: 60
 
-    - name: Installer les applications Kubeflow
+    - name: Installer Central Dashboard
       shell: |
         cd {{ workdir }}/manifests
-        
-        # Central Dashboard
         kustomize build apps/centraldashboard/upstream/overlays/kserve | kubectl apply -f -
-        
-        # Admission Webhook
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Installer Admission Webhook
+      shell: |
+        cd {{ workdir }}/manifests
         kustomize build apps/admission-webhook/upstream/overlays/cert-manager | kubectl apply -f -
-        
-        # Notebook Controller
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Installer Notebook Controller et Jupyter Web App
+      shell: |
+        cd {{ workdir }}/manifests
         kustomize build apps/jupyter/notebook-controller/upstream/overlays/kubeflow | kubectl apply -f -
-        
-        # Jupyter Web App
         kustomize build apps/jupyter/jupyter-web-app/upstream/overlays/istio | kubectl apply -f -
-        
-        # Profiles + KFAM
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Installer Profiles + KFAM
+      shell: |
+        cd {{ workdir }}/manifests
         kustomize build apps/profiles-kfam/upstream/overlays/kubeflow | kubectl apply -f -
-        
-        # Volumes Web App
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Installer Volumes Web App
+      shell: |
+        cd {{ workdir }}/manifests
         kustomize build apps/volumes-web-app/upstream/overlays/istio | kubectl apply -f -
-        
-        # Tensorboard
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Installer Tensorboard
+      shell: |
+        cd {{ workdir }}/manifests
         kustomize build apps/tensorboard/tensorboard-controller/upstream/overlays/kubeflow | kubectl apply -f -
         kustomize build apps/tensorboard/tensorboards-web-app/upstream/overlays/istio | kubectl apply -f -
-        
-        # Training Operator
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Installer Training Operator
+      shell: |
+        cd {{ workdir }}/manifests
         kustomize build apps/training-operator/upstream/overlays/kubeflow | kubectl apply -f -
-        
-        # User Namespace
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Installer User Namespace
+      shell: |
+        cd {{ workdir }}/manifests
         kustomize build common/user-namespace/base | kubectl apply -f -
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
-      ignore_errors: yes
 
-    - name: Attendre le déploiement progressif des composants
+    - name: Attendre que les pods Kubeflow soient prêts
       shell: |
-        echo "Attente du déploiement des composants Kubeflow..."
-        for namespace in kubeflow istio-system cert-manager auth knative-serving knative-eventing; do
-          echo "Vérification du namespace: $namespace"
-          kubectl wait --for=condition=Ready pod --all -n $namespace --timeout=600s || echo "Timeout pour $namespace, continuing..."
-        done
+        echo "Attente du déploiement des composants..."
+        sleep 60
+        kubectl wait --for=condition=Ready pod --all -n kubeflow --timeout=600s || echo "Timeout kubeflow"
+        kubectl wait --for=condition=Ready pod --all -n istio-system --timeout=300s || echo "Timeout istio"
+        kubectl wait --for=condition=Ready pod --all -n cert-manager --timeout=300s || echo "Timeout cert-manager"
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
       ignore_errors: yes
 
-    - name: Configurer accès externe Kubeflow (NodePort)
+    - name: Configurer l'accès externe (NodePort)
       shell: kubectl patch service istio-ingressgateway -n istio-system -p '{"spec":{"type":"NodePort"}}'
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
 
-    - name: Obtenir URL d'accès Kubeflow
-      shell: |
-        NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-        NODE_PORT=$(kubectl get svc istio-ingressgateway -n istio-system -o jsonpath='{.spec.ports[?(@.name=="http2")].nodePort}')
-        echo "http://${NODE_IP}:${NODE_PORT}"
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      register: kubeflow_url
-
-    - name: Créer Profile utilisateur par défaut
+    - name: Créer un utilisateur par défaut
       shell: |
         kubectl apply -f - <<EOF
         apiVersion: kubeflow.org/v1beta1
@@ -378,74 +231,88 @@
         KUBECONFIG: "{{ kubeconfig_path }}"
       ignore_errors: yes
 
-    # --- Vérifications et rapports ---
-
-    - name: Vérifier état Rook-Ceph
-      shell: kubectl get pods -n rook-ceph
+    - name: Obtenir l'URL d'accès Kubeflow
+      shell: |
+        NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+        NODE_PORT=$(kubectl get svc istio-ingressgateway -n istio-system -o jsonpath='{.spec.ports[?(@.name=="http2")].nodePort}')
+        echo "http://${NODE_IP}:${NODE_PORT}"
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
-      register: rook_status
+      register: kubeflow_url
 
-    - name: Vérifier état Kubeflow
+    - name: Vérifier l'état des pods Kubeflow
       shell: kubectl get pods -n kubeflow
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
-      register: kubeflow_status
+      register: kubeflow_pods
 
-    - name: Vérifier StorageClasses
-      shell: kubectl get storageclass
+    - name: Vérifier l'état des pods Istio
+      shell: kubectl get pods -n istio-system
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
-      register: storage_status
+      register: istio_pods
 
-    - name: Afficher état Rook-Ceph
+    - name: Afficher l'état des pods Kubeflow
       debug:
-        var: rook_status.stdout_lines
+        var: kubeflow_pods.stdout_lines
 
-    - name: Afficher état Kubeflow
+    - name: Afficher l'état des pods Istio
       debug:
-        var: kubeflow_status.stdout_lines
+        var: istio_pods.stdout_lines
 
-    - name: Afficher StorageClasses
-      debug:
-        var: storage_status.stdout_lines
-
-    - name: Afficher informations de connexion
+    - name: Afficher les informations de connexion
       debug:
         msg: |
           ============================================
-          🎉 INSTALLATION TERMINÉE !
+          🎉 INSTALLATION KUBEFLOW TERMINÉE !
           ============================================
-          Kubeflow URL : {{ kubeflow_url.stdout }}
+          URL d'accès : {{ kubeflow_url.stdout }}
           Email : user@example.com
-          Mot de passe : kubeflow123
-          
-          Notes importantes :
-          - L'installation peut prendre du temps pour être complètement opérationnelle
-          - Vérifiez l'état des pods avec: kubectl get pods --all-namespaces
-          - Pour Kubeflow, le mot de passe par défaut est : kubeflow123
+          Mot de passe : 12341234
+          ============================================
+          Note: L'installation peut prendre quelques minutes
+          pour être complètement opérationnelle.
           ============================================
 
     - name: Sauvegarder les informations d'accès
       copy:
         content: |
-          # Kubeflow Access Info
+          # Kubeflow Access Information
           URL: {{ kubeflow_url.stdout }}
           Email: user@example.com
-          Password: kubeflow123
+          Password: 12341234
           
-          # Commandes de vérification utiles
-          kubectl get pods -n rook-ceph
+          # Commandes utiles pour vérifier l'installation
           kubectl get pods -n kubeflow
           kubectl get pods -n istio-system
-          kubectl get storageclass
+          kubectl get svc -n istio-system
           
           # Commandes de dépannage
           kubectl describe pods -n kubeflow
-          kubectl logs -n kubeflow deployment/centraldashboard
+          kubectl logs -n kubeflow -l app=centraldashboard
           kubectl get events --all-namespaces --sort-by='.lastTimestamp'
-          
-          # Accès aux logs Rook-Ceph
-          kubectl logs -n rook-ceph deployment/rook-ceph-operator
         dest: "{{ workdir }}/kubeflow-access-info.txt"
         mode: '0644'
+
+    - name: Créer script de vérification
+      copy:
+        content: |
+          #!/bin/bash
+          echo "=== État du cluster ==="
+          kubectl get nodes
+          echo ""
+          echo "=== Pods Kubeflow ==="
+          kubectl get pods -n kubeflow
+          echo ""
+          echo "=== Pods Istio ==="
+          kubectl get pods -n istio-system
+          echo ""
+          echo "=== Services Istio ==="
+          kubectl get svc -n istio-system
+          echo ""
+          echo "=== URL Kubeflow ==="
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+          NODE_PORT=$(kubectl get svc istio-ingressgateway -n istio-system -o jsonpath='{.spec.ports[?(@.name=="http2")].nodePort}')
+          echo "http://${NODE_IP}:${NODE_PORT}"
+        dest: "{{ workdir }}/check-kubeflow.sh"
+        mode: '0755'
