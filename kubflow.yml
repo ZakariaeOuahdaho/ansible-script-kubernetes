@@ -104,6 +104,7 @@
         kustomize build common/istio-1-16/istio-install/base | kubectl apply -f -
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
+      ignore_errors: yes
 
     - name: Attendre qu'Istio soit prêt
       shell: kubectl wait --for=condition=Ready pod -l app=istiod -n istio-system --timeout=600s
@@ -166,7 +167,7 @@
     - name: Installer Profiles + KFAM
       shell: |
         cd {{ workdir }}/manifests
-        kustomize build apps/profiles-kfam/upstream/overlays/kubeflow | kubectl apply -f -
+        kustomize build apps/profiles/upstream/overlays/kubeflow | kubectl apply -f -
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
 
