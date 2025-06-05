@@ -1,5 +1,5 @@
 ---
-- name: Installation de Kubeflow sur cluster Kubernetes
+- name: Installation de Kubeflow sur cluster Kubernetes avec Rook Ceph
   hosts: localhost
   become: yes
   gather_facts: no
@@ -45,14 +45,15 @@
         kubectl delete namespace knative-eventing --ignore-not-found=true
         kubectl delete namespace knative-serving --ignore-not-found=true
         kubectl delete namespace auth --ignore-not-found=true
+        kubectl delete namespace rook-ceph --ignore-not-found=true
       environment:
         KUBECONFIG: "{{ kubeconfig_path }}"
       ignore_errors: yes
 
     - name: Attendre la suppression des namespaces
       shell: |
-        while kubectl get namespace kubeflow 2>/dev/null; do
-          echo "Attente suppression namespace kubeflow..."
+        while kubectl get namespace kubeflow 2>/dev/null || kubectl get namespace rook-ceph 2>/dev/null; do
+          echo "Attente suppression namespaces kubeflow/rook-ceph..."
           sleep 5
         done
       environment:
@@ -78,6 +79,58 @@
         dest: "{{ workdir }}/manifests"
         version: "{{ kubeflow_version }}"
         force: yes
+
+    # --- Déploiement Rook Ceph ---
+
+    - name: Cloner le dépôt rook/ceph manifests
+      git:
+        repo: "https://github.com/rook/rook.git"
+        dest: "{{ workdir }}/rook"
+        version: "v1.11.7"
+        force: yes
+
+    - name: Créer le namespace rook-ceph
+      shell: kubectl create namespace rook-ceph --dry-run=client -o yaml | kubectl apply -f -
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Installer l'operator Rook Ceph
+      shell: |
+        kubectl apply -f /opt/kubeflow-install/rook/cluster/examples/kubernetes/ceph/crds.yaml
+        kubectl apply -f /opt/kubeflow-install/rook/cluster/examples/kubernetes/ceph/common.yaml
+        kubectl apply -f /opt/kubeflow-install/rook/cluster/examples/kubernetes/ceph/operator.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+
+    - name: Installer le cluster Ceph
+      shell: |
+        cd {{ workdir }}/rook/cluster/examples/kubernetes/ceph
+        kubectl apply -f cluster.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Attendre que le cluster Ceph soit prêt
+      shell: |
+        kubectl -n rook-ceph wait --for=condition=Ready pod -l app=rook-ceph-mgr --timeout=600s
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Installer les ressources pour le stockage Rook Ceph (StorageClass)
+      shell: |
+        cd {{ workdir }}/rook/cluster/examples/kubernetes/ceph
+        kubectl apply -f csi/rbd/storageclass.yaml
+        kubectl apply -f csi/rbd/rbd-provisioner.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    - name: Définir StorageClass par défaut pour Rook Ceph
+      shell: |
+        kubectl patch storageclass rook-ceph-block -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+
+    # --- Fin Rook Ceph ---
 
     - name: Installer cert-manager
       shell: |
