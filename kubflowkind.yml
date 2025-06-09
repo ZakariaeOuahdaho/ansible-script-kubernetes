@@ -1,0 +1,22 @@
+# Au début de votre master.yml, ajoutez ces vérifications :
+- name: Vérifications préalables
+  shell: |
+    echo "=== VÉRIFICATIONS ==="
+    echo "Processus parasites:"
+    ps aux | grep -E "(kubectl|kustomize)" | grep -v grep || echo "Aucun"
+    echo "Ports occupés:"
+    ss -tuln | grep -E "(8080|6443)" || echo "Libres"
+    echo "Docker containers:"
+    docker ps 2>/dev/null || echo "Docker arrêté"
+  register: pre_check
+
+- name: Afficher vérifications
+  debug:
+    var: pre_check.stdout_lines
+
+    # Reset total du système (dernière option)
+sudo apt purge -y kubeadm kubectl kubelet kubernetes-cni
+sudo apt autoremove -y
+sudo rm -rf /etc/kubernetes /var/lib/kubelet /var/lib/etcd /root/.kube
+sudo iptables -F && sudo iptables -t nat -F && sudo iptables -t mangle -F && sudo iptables -X
+sudo rebootzzzsz

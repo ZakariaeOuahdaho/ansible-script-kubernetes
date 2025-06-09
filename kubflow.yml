@@ -1,319 +1,263 @@
 ---
-- name: Installation de Kubeflow sur cluster Kubernetes
+- name: Installation Kubeflow avec MicroK8s (Simple et efficace)
   hosts: localhost
   become: yes
   gather_facts: no
 
-  vars:
-    kubeflow_version: "v1.7.0"
-    workdir: "/opt/kubeflow-install"
-    kubeconfig_path: "/root/.kube/config"
-
   tasks:
 
-    - name: Vérifier que le cluster Kubernetes est opérationnel
-      shell: kubectl get nodes
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      register: cluster_status
-      failed_when: cluster_status.rc != 0
+    - name: Vérifier l'état actuel
+      shell: |
+        echo "=== Système actuel ==="
+        free -h
+        df -h
+        ip addr show | grep inet
+      register: system_info
 
-    - name: Afficher l'état du cluster
+    - name: Afficher infos système
       debug:
-        var: cluster_status.stdout_lines
+        var: system_info.stdout_lines
 
-    - name: Installer les dépendances nécessaires
+    - name: Arrêter le cluster Kubernetes existant (pour éviter les conflits)
+      shell: |
+        systemctl stop kubelet || true
+        systemctl stop containerd || true
+        # Libérer les ports
+        fuser -k 6443/tcp || true
+        fuser -k 8080/tcp || true
+        fuser -k 16443/tcp || true
+      ignore_errors: yes
+
+    - name: Installer snapd si nécessaire
       apt:
-        name:
-          - git
-          - curl
-          - wget
+        name: snapd
         state: present
         update_cache: yes
 
-    - name: Créer le répertoire de travail
-      file:
-        path: "{{ workdir }}"
-        state: directory
-        mode: '0755'
+    - name: Installer MicroK8s
+      snap:
+        name: microk8s
+        classic: yes
+        state: present
 
-    - name: Nettoyer ancienne installation Kubeflow
-      shell: |
-        kubectl delete namespace kubeflow --ignore-not-found=true
-        kubectl delete namespace istio-system --ignore-not-found=true
-        kubectl delete namespace cert-manager --ignore-not-found=true
-        kubectl delete namespace knative-eventing --ignore-not-found=true
-        kubectl delete namespace knative-serving --ignore-not-found=true
-        kubectl delete namespace auth --ignore-not-found=true
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
+    - name: Ajouter l'utilisateur au groupe microk8s
+      user:
+        name: "{{ ansible_user | default('root') }}"
+        groups: microk8s
+        append: yes
+
+    - name: Ajouter l'utilisateur zk au groupe microk8s
+      user:
+        name: zk
+        groups: microk8s
+        append: yes
       ignore_errors: yes
 
-    - name: Attendre la suppression des namespaces
+    - name: Attendre que MicroK8s soit prêt
+      shell: microk8s status --wait-ready
+      timeout: 300
+
+    - name: Activer les addons de base
       shell: |
-        while kubectl get namespace kubeflow 2>/dev/null; do
-          echo "Attente suppression namespace kubeflow..."
-          sleep 5
-        done
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      ignore_errors: yes
+        microk8s enable dns
+        microk8s enable storage
+        microk8s enable ingress
+      register: addons_basic
 
-    - name: Vérifier si kustomize est installé
-      command: which kustomize
-      register: kustomize_check
-      ignore_errors: yes
-
-    - name: Installer kustomize
-      shell: |
-        cd /tmp
-        curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
-        chmod +x kustomize
-        mv kustomize /usr/local/bin/
-      when: kustomize_check.rc != 0
-
-    - name: Cloner le dépôt Kubeflow manifests
-      git:
-        repo: "https://github.com/kubeflow/manifests.git"
-        dest: "{{ workdir }}/manifests"
-        version: "{{ kubeflow_version }}"
-        force: yes
-
-    - name: Installer cert-manager
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build common/cert-manager/cert-manager/base | kubectl apply -f -
-        kubectl wait --for condition=established --timeout=60s crd/certificates.cert-manager.io
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      register: cert_manager_result
-      until: cert_manager_result.rc == 0
-      retries: 3
-      delay: 30
-
-    - name: Attendre que cert-manager soit prêt
-      shell: kubectl wait --for=condition=Ready pod -l app=cert-manager -n cert-manager --timeout=300s
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Installer Istio
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build common/istio-1-16/istio-crds/base | kubectl apply -f -
-        kustomize build common/istio-1-16/istio-namespace/base | kubectl apply -f -
-        kustomize build common/istio-1-16/istio-install/base | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      ignore_errors: yes
-
-    - name: Attendre qu'Istio soit prêt
-      shell: kubectl wait --for=condition=Ready pod -l app=istiod -n istio-system --timeout=600s
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Installer Dex (Auth)
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build common/dex/overlays/istio | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Installer OIDC AuthService
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build common/oidc-authservice/base | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Installer Knative
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build common/knative/knative-serving/overlays/gateways | kubectl apply -f -
-        kustomize build common/knative/knative-eventing/base | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Installer les ressources Kubeflow de base
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build common/kubeflow-namespace/base | kubectl apply -f -
-        kustomize build common/kubeflow-roles/base | kubectl apply -f -
-        kustomize build common/istio-1-16/kubeflow-istio-resources/base | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Installer Central Dashboard
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build apps/centraldashboard/upstream/overlays/kserve | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Installer Admission Webhook
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build apps/admission-webhook/upstream/overlays/cert-manager | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Installer Notebook Controller et Jupyter Web App
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build apps/jupyter/notebook-controller/upstream/overlays/kubeflow | kubectl apply -f -
-        kustomize build apps/jupyter/jupyter-web-app/upstream/overlays/istio | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Installer Profiles + KFAM
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build apps/profiles/upstream/overlays/kubeflow | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Installer Volumes Web App
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build apps/volumes-web-app/upstream/overlays/istio | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Installer Tensorboard
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build apps/tensorboard/tensorboard-controller/upstream/overlays/kubeflow | kubectl apply -f -
-        kustomize build apps/tensorboard/tensorboards-web-app/upstream/overlays/istio | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Installer Training Operator
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build apps/training-operator/upstream/overlays/kubeflow | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Installer User Namespace
-      shell: |
-        cd {{ workdir }}/manifests
-        kustomize build common/user-namespace/base | kubectl apply -f -
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Attendre que les pods Kubeflow soient prêts
-      shell: |
-        echo "Attente du déploiement des composants..."
-        sleep 60
-        kubectl wait --for=condition=Ready pod --all -n kubeflow --timeout=600s || echo "Timeout kubeflow"
-        kubectl wait --for=condition=Ready pod --all -n istio-system --timeout=300s || echo "Timeout istio"
-        kubectl wait --for=condition=Ready pod --all -n cert-manager --timeout=300s || echo "Timeout cert-manager"
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      ignore_errors: yes
-
-    - name: Configurer l'accès externe (NodePort)
-      shell: kubectl patch service istio-ingressgateway -n istio-system -p '{"spec":{"type":"NodePort"}}'
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-
-    - name: Créer un utilisateur par défaut
-      shell: |
-        kubectl apply -f - <<EOF
-        apiVersion: kubeflow.org/v1beta1
-        kind: Profile
-        metadata:
-          name: kubeflow-user-example-com
-        spec:
-          owner:
-            kind: User
-            name: user@example.com
-        EOF
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      ignore_errors: yes
-
-    - name: Obtenir l'URL d'accès Kubeflow
-      shell: |
-        NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-        NODE_PORT=$(kubectl get svc istio-ingressgateway -n istio-system -o jsonpath='{.spec.ports[?(@.name=="http2")].nodePort}')
-        echo "http://${NODE_IP}:${NODE_PORT}"
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      register: kubeflow_url
-
-    - name: Vérifier l'état des pods Kubeflow
-      shell: kubectl get pods -n kubeflow
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      register: kubeflow_pods
-
-    - name: Vérifier l'état des pods Istio
-      shell: kubectl get pods -n istio-system
-      environment:
-        KUBECONFIG: "{{ kubeconfig_path }}"
-      register: istio_pods
-
-    - name: Afficher l'état des pods Kubeflow
+    - name: Afficher résultat addons de base
       debug:
-        var: kubeflow_pods.stdout_lines
+        var: addons_basic.stdout_lines
 
-    - name: Afficher l'état des pods Istio
+    - name: Attendre stabilisation
+      pause:
+        seconds: 60
+
+    - name: Installer Kubeflow via MicroK8s
+      shell: |
+        echo "Installation de Kubeflow..."
+        microk8s enable kubeflow
+      register: kubeflow_install
+      timeout: 1800  # 30 minutes max
+
+    - name: Afficher résultat installation Kubeflow
       debug:
-        var: istio_pods.stdout_lines
+        var: kubeflow_install.stdout_lines
 
-    - name: Afficher les informations de connexion
-      debug:
-        msg: |
-          ============================================
-          🎉 INSTALLATION KUBEFLOW TERMINÉE !
-          ============================================
-          URL d'accès : {{ kubeflow_url.stdout }}
-          Email : user@example.com
-          Mot de passe : 12341234
-          ============================================
-          Note: L'installation peut prendre quelques minutes
-          pour être complètement opérationnelle.
-          ============================================
+    - name: Attendre que tous les pods soient prêts
+      shell: |
+        echo "Attente que Kubeflow soit complètement déployé..."
+        sleep 120
+        microk8s kubectl wait --for=condition=Ready pod --all -n kubeflow --timeout=600s || echo "Certains pods démarrent encore"
+      ignore_errors: yes
 
-    - name: Sauvegarder les informations d'accès
-      copy:
-        content: |
-          # Kubeflow Access Information
-          URL: {{ kubeflow_url.stdout }}
-          Email: user@example.com
-          Password: 12341234
-          
-          # Commandes utiles pour vérifier l'installation
-          kubectl get pods -n kubeflow
-          kubectl get pods -n istio-system
-          kubectl get svc -n istio-system
-          
-          # Commandes de dépannage
-          kubectl describe pods -n kubeflow
-          kubectl logs -n kubeflow -l app=centraldashboard
-          kubectl get events --all-namespaces --sort-by='.lastTimestamp'
-        dest: "{{ workdir }}/kubeflow-access-info.txt"
-        mode: '0644'
+    - name: Configurer l'accès externe
+      shell: |
+        # Obtenir le service istio-ingressgateway
+        microk8s kubectl patch service istio-ingressgateway -n istio-system -p '{"spec":{"type":"NodePort"}}' || true
+        
+        # Alternative: port-forward permanent en arrière-plan
+        nohup microk8s kubectl port-forward service/istio-ingressgateway 8080:80 -n istio-system --address=0.0.0.0 > /var/log/kubeflow-port-forward.log 2>&1 &
+      ignore_errors: yes
 
-    - name: Créer script de vérification
+    - name: Créer les alias kubectl pour faciliter l'usage
       copy:
         content: |
           #!/bin/bash
-          echo "=== État du cluster ==="
-          kubectl get nodes
+          alias kubectl='microk8s kubectl'
+          alias k='microk8s kubectl'
+          export KUBECONFIG=/var/snap/microk8s/current/credentials/kubelet.config
+        dest: /etc/profile.d/microk8s.sh
+        mode: '0644'
+
+    - name: Configurer kubectl pour l'utilisateur zk
+      shell: |
+        mkdir -p /home/zk/.kube
+        microk8s config > /home/zk/.kube/config
+        chown -R zk:zk /home/zk/.kube
+      ignore_errors: yes
+
+    - name: Obtenir les informations d'accès
+      shell: |
+        echo "=== INFORMATIONS D'ACCÈS KUBEFLOW ==="
+        
+        # IP du serveur
+        SERVER_IP=$(ip route get 8.8.8.8 | awk '{print $7; exit}')
+        echo "IP du serveur: $SERVER_IP"
+        
+        # Port NodePort si disponible
+        NODE_PORT=$(microk8s kubectl get svc istio-ingressgateway -n istio-system -o jsonpath='{.spec.ports[?(@.name=="http2")].nodePort}' 2>/dev/null || echo "")
+        
+        if [ ! -z "$NODE_PORT" ]; then
+          echo "URL NodePort: http://$SERVER_IP:$NODE_PORT"
+        fi
+        
+        echo "URL Port-Forward: http://$SERVER_IP:8080"
+        echo "URL Local: http://localhost:8080"
+        
+        echo ""
+        echo "=== ÉTAT DU CLUSTER ==="
+        microk8s kubectl get nodes
+        echo ""
+        echo "=== PODS KUBEFLOW ==="
+        microk8s kubectl get pods -n kubeflow | head -10
+        echo ""
+        echo "=== SERVICES ==="
+        microk8s kubectl get svc -n istio-system
+        
+      register: access_info
+
+    - name: Afficher les informations d'accès
+      debug:
+        var: access_info.stdout_lines
+
+    - name: Créer un script d'accès rapide
+      copy:
+        content: |
+          #!/bin/bash
+          # Script d'accès rapide à Kubeflow
+          
+          echo "🚀 KUBEFLOW ACCESS SCRIPT 🚀"
+          echo "============================="
+          
+          SERVER_IP=$(ip route get 8.8.8.8 | awk '{print $7; exit}')
+          
+          echo "Votre serveur: $SERVER_IP"
           echo ""
-          echo "=== Pods Kubeflow ==="
-          kubectl get pods -n kubeflow
+          echo "Options d'accès:"
+          echo "1. Port-forward (recommandé): http://$SERVER_IP:8080"
+          echo "2. Accès local: http://localhost:8080"
           echo ""
-          echo "=== Pods Istio ==="
-          kubectl get pods -n istio-system
+          echo "Identifiants par défaut:"
+          echo "Email: user@example.com"
+          echo "Mot de passe: 12341234"
           echo ""
-          echo "=== Services Istio ==="
-          kubectl get svc -n istio-system
+          echo "Commandes utiles:"
+          echo "microk8s kubectl get pods -n kubeflow"
+          echo "microk8s kubectl get svc -n istio-system"
           echo ""
-          echo "=== URL Kubeflow ==="
-          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-          NODE_PORT=$(kubectl get svc istio-ingressgateway -n istio-system -o jsonpath='{.spec.ports[?(@.name=="http2")].nodePort}')
-          echo "http://${NODE_IP}:${NODE_PORT}"
-        dest: "{{ workdir }}/check-kubeflow.sh"
+          echo "Redémarrer le port-forward si nécessaire:"
+          echo "pkill -f 'kubectl port-forward'"
+          echo "nohup microk8s kubectl port-forward service/istio-ingressgateway 8080:80 -n istio-system --address=0.0.0.0 &"
+          echo ""
+          echo "============================="
+          
+          # Vérifier si le port-forward fonctionne
+          if curl -s http://localhost:8080 >/dev/null 2>&1; then
+            echo "✅ Kubeflow est accessible sur http://$SERVER_IP:8080"
+          else
+            echo "⚠️  Redémarrage du port-forward..."
+            pkill -f 'kubectl port-forward' 2>/dev/null || true
+            nohup microk8s kubectl port-forward service/istio-ingressgateway 8080:80 -n istio-system --address=0.0.0.0 > /var/log/kubeflow-port-forward.log 2>&1 &
+            sleep 5
+            echo "🔄 Port-forward redémarré"
+          fi
+        dest: /usr/local/bin/kubeflow-access
         mode: '0755'
+
+    - name: Afficher le résumé final
+      debug:
+        msg: |
+          ========================================
+          🎉 KUBEFLOW INSTALLÉ AVEC MICROK8S! 🎉
+          ========================================
+          
+          🌐 ACCÈS À L'INTERFACE:
+          http://{{ ansible_default_ipv4.address | default('VOTRE_IP') }}:8080
+          ou
+          http://localhost:8080
+          
+          👤 CONNEXION:
+          Email: user@example.com
+          Mot de passe: 12341234
+          
+          🔧 COMMANDES UTILES:
+          /usr/local/bin/kubeflow-access
+          microk8s kubectl get pods -n kubeflow
+          microk8s status
+          
+          📝 NOTES:
+          - MicroK8s fonctionne indépendamment de votre cluster existant
+          - Port-forward automatique sur le port 8080
+          - Utilisez 'kubeflow-access' pour vérifier l'état
+          
+          ========================================
+
+    - name: Sauvegarder les informations
+      copy:
+        content: |
+          # Kubeflow avec MicroK8s - Guide d'accès
+          
+          ## Accès à l'interface
+          URL: http://{{ ansible_default_ipv4.address | default('VOTRE_IP') }}:8080
+          URL locale: http://localhost:8080
+          
+          ## Connexion
+          Email: user@example.com
+          Mot de passe: 12341234
+          
+          ## Commandes de gestion
+          
+          # État du cluster
+          microk8s status
+          microk8s kubectl get nodes
+          
+          # Pods Kubeflow
+          microk8s kubectl get pods -n kubeflow
+          microk8s kubectl get pods -n istio-system
+          
+          # Services
+          microk8s kubectl get svc -n istio-system
+          
+          # Logs en cas de problème
+          microk8s kubectl logs -n kubeflow -l app=ml-pipeline
+          
+          # Redémarrer le port-forward si nécessaire
+          pkill -f 'kubectl port-forward'
+          nohup microk8s kubectl port-forward service/istio-ingressgateway 8080:80 -n istio-system --address=0.0.0.0 &
+          
+          # Script d'accès rapide
+          /usr/local/bin/kubeflow-access
+          
+          ## Installation terminée le: $(date)
+        dest: ./kubeflow-microk8s-access.txt
+        mode: '0644'

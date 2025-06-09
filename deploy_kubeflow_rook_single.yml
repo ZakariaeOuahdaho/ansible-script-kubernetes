@@ -1,0 +1,593 @@
+---
+- name: Déploiement de Kubeflow avec Rook-Ceph sur Kubernetes
+  hosts: localhost
+  become: yes
+  gather_facts: no
+  vars:
+    kubeflow_version: "v1.8.0"
+    kustomize_version: "v5.2.1"
+    rook_version: "v1.12.9"
+
+  tasks:
+    # ===== VÉRIFICATION PRÉALABLE =====
+    - name: Vérifier que le cluster est opérationnel
+      shell: kubectl get nodes
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: cluster_check
+      failed_when: cluster_check.rc != 0
+
+    - name: Afficher l'état du cluster
+      debug:
+        msg: "{{ cluster_check.stdout_lines }}"
+    - name: Installer jq via wget
+      shell: |
+        wget -qO- https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64 -O /usr/local/bin/jq
+        chmod +x /usr/local/bin/jq
+
+
+    - name: Vérifier que tous les nœuds sont Ready
+      shell: kubectl get nodes -o json | jq -r '.items[].status.conditions[] | select(.type=="Ready") | .status' | grep -v True || echo "all_ready"
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: nodes_ready
+      failed_when: nodes_ready.stdout != "all_ready"
+
+    # ===== INSTALLATION DES PRÉREQUIS =====
+    - name: Installer les outils nécessaires
+      apt:
+        name:
+          - python3-pip
+          - git
+          - wget
+          - jq
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Installer kustomize
+      shell: |
+        if [ ! -f /usr/local/bin/kustomize ]; then
+          wget -O kustomize.tar.gz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F{{ kustomize_version }}/kustomize_{{ kustomize_version }}_linux_amd64.tar.gz
+          tar xzf kustomize.tar.gz
+          mv kustomize /usr/local/bin/
+          chmod +x /usr/local/bin/kustomize
+          rm -f kustomize.tar.gz
+        fi
+      args:
+        creates: /usr/local/bin/kustomize
+
+    # ===== INSTALLATION DE ROOK-CEPH =====
+    - name: Créer le répertoire de travail Rook
+      file:
+        path: /opt/rook-deploy
+        state: directory
+        mode: '0755'
+
+    - name: Télécharger les manifests Rook
+      get_url:
+        url: "https://raw.githubusercontent.com/rook/rook/{{ rook_version }}/deploy/examples/{{ item }}"
+        dest: "/opt/rook-deploy/{{ item }}"
+        mode: '0644'
+      loop:
+        - crds.yaml
+        - common.yaml
+        - operator.yaml
+
+    - name: Appliquer les CRDs Rook
+      shell: kubectl apply -f /opt/rook-deploy/crds.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Appliquer les ressources communes Rook
+      shell: kubectl apply -f /opt/rook-deploy/common.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Déployer l'opérateur Rook
+      shell: kubectl apply -f /opt/rook-deploy/operator.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Attendre que l'opérateur Rook soit prêt
+      shell: kubectl -n rook-ceph wait --for=condition=ready pod -l app=rook-ceph-operator --timeout=300s
+      environment:
+        KUBECONFIG: /root/.kube/config
+      retries: 3
+      delay: 10
+
+    - name: Créer la configuration du cluster Ceph pour environnement de test (version simplifiée)
+      copy:
+        content: |
+          apiVersion: ceph.rook.io/v1
+          kind: CephCluster
+          metadata:
+            name: rook-ceph
+            namespace: rook-ceph
+          spec:
+            cephVersion:
+              image: quay.io/ceph/ceph:v18.2.0
+            dataDirHostPath: /var/lib/rook
+            mon:
+              count: 1
+              allowMultiplePerNode: true
+            dashboard:
+              enabled: true
+            storage:
+              useAllNodes: true
+              useAllDevices: true
+              config:
+                osdsPerDevice: "1"
+            resources:
+              mgr:
+                limits:
+                  memory: "512Mi"
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+              mon:
+                limits:
+                  memory: "1Gi"
+                requests:
+                  cpu: "100m"
+                  memory: "256Mi"
+              osd:
+                limits:
+                  memory: "5Gi"
+                requests:
+                  cpu: "100m"
+                  memory: "512Mi"
+        dest: /opt/rook-deploy/cluster-test.yaml
+
+    - name: Déployer le cluster Ceph
+      shell: kubectl apply -f /opt/rook-deploy/cluster-test.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Attendre que le cluster Ceph soit prêt (peut prendre plusieurs minutes)
+      shell: |
+        echo "Attente du déploiement Ceph..."
+        kubectl -n rook-ceph wait --for=condition=ready cephcluster rook-ceph --timeout=900s
+      environment:
+        KUBECONFIG: /root/.kube/config
+      retries: 5
+      delay: 60
+
+    - name: Créer le CephBlockPool et StorageClass
+      copy:
+        dest: /opt/rook-deploy/storageclass.yaml
+        content: |
+          apiVersion: ceph.rook.io/v1
+          kind: CephBlockPool
+          metadata:
+            name: replicapool
+            namespace: rook-ceph
+          spec:
+            failureDomain: host
+            replicated:
+              size: 1
+          ---
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: rook-ceph-block
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+          provisioner: rook-ceph.rbd.csi.ceph.com
+          parameters:
+            clusterID: rook-ceph
+            pool: replicapool
+            imageFormat: "2"
+            imageFeatures: layering
+            csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+            csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+            csi.storage.k8s.io/controller-expand-secret-name: rook-csi-rbd-provisioner
+            csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+            csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+            csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+            csi.storage.k8s.io/fstype: ext4
+          allowVolumeExpansion: true
+          reclaimPolicy: Delete
+
+    - name: Appliquer le StorageClass
+      shell: kubectl apply -f /opt/rook-deploy/storageclass.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Vérifier le StorageClass
+      shell: kubectl get storageclass
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: sc_check
+
+    - name: Afficher les StorageClass disponibles
+      debug:
+        var: sc_check.stdout_lines
+
+    - name: Vérifier les PVC
+      shell: kubectl get pvc -A
+      register: pvc_status
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Afficher statut PVC
+      debug:
+        var: pvc_status.stdout_lines
+
+    - name: Créer des PV locaux si nécessaire (pour test)
+      copy:
+        content: |
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: katib-mysql-pv
+          spec:
+            capacity:
+              storage: 10Gi
+            accessModes:
+              - ReadWriteOnce
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: rook-ceph-block
+            csi:
+              driver: rook-ceph.rbd.csi.ceph.com
+              volumeHandle: katib-mysql-pv
+          ---
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: minio-pv
+          spec:
+            capacity:
+              storage: 20Gi
+            accessModes:
+              - ReadWriteOnce
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: rook-ceph-block
+            csi:
+              driver: rook-ceph.rbd.csi.ceph.com
+              volumeHandle: minio-pv
+        dest: /opt/kubeflow-deploy/pvs.yaml
+        
+    - name: Appliquer PVs
+      shell: kubectl apply -f /opt/kubeflow-deploy/pvs.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+
+    # ===== INSTALLATION DE KUBEFLOW =====
+    - name: Cloner le repository Kubeflow
+      git:
+        repo: https://github.com/kubeflow/manifests.git
+        dest: /opt/kubeflow-manifests
+        version: "{{ kubeflow_version }}"
+        force: yes
+
+    - name: Créer le répertoire de déploiement personnalisé
+      file:
+        path: /opt/kubeflow-deploy
+        state: directory
+        mode: '0755'
+
+    - name: Installer cert-manager
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build common/cert-manager/cert-manager/base | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Attendre que cert-manager webhook soit complètement prêt
+      shell: |
+        kubectl wait --for=condition=ready pod -l app=webhook,app.kubernetes.io/name=webhook,app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=300s
+        kubectl wait --for=condition=ready pod -l app=cert-manager -n cert-manager --timeout=300s
+        kubectl wait --for=condition=ready pod -l app=cainjector -n cert-manager --timeout=300s
+        sleep 30  # Attente supplémentaire pour les webhooks
+      environment:
+        KUBECONFIG: /root/.kube/config
+      retries: 3
+      delay: 30
+
+    - name: Installer Istio CRDs
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build common/istio-1-17/istio-crds/base | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Installer Istio namespace
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build common/istio-1-17/istio-namespace/base | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Installer Istio
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build common/istio-1-17/istio-install/base | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Attendre Istio
+      shell: |
+        kubectl wait --for=condition=Available --timeout=300s deployment istiod -n istio-system
+      environment:
+        KUBECONFIG: /root/.kube/config
+      retries: 3
+      delay: 30
+
+    - name: Installer Knative Serving (correction)
+      shell: |
+        cd /opt/kubeflow-manifests
+        # Appliquer deux fois - première fois pour les CRDs, deuxième fois pour le reste
+        kustomize build common/knative/knative-serving/overlays/gateways | kubectl apply -f - || true
+        sleep 10
+        kustomize build common/knative/knative-serving/overlays/gateways | kubectl apply -f - || true
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+      
+    - name: Installer Knative Eventing
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build common/knative/knative-eventing/base | kubectl apply -f - || true
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+
+    - name: Supprimer complètement MySQL existant
+      shell: |
+        # Supprimer TOUTES les ressources MySQL
+        kubectl delete deployment mysql -n kubeflow --ignore-not-found --force --grace-period=0
+        kubectl delete service mysql -n kubeflow --ignore-not-found
+        kubectl delete pvc mysql-pv-claim -n kubeflow --ignore-not-found
+        kubectl delete pv mysql-pv --ignore-not-found
+        kubectl delete secret mysql-secret -n kubeflow --ignore-not-found
+        # Attendre la suppression complète
+        sleep 20
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+
+
+
+
+
+    - name: Créer namespace kubeflow
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build common/kubeflow-namespace/base | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Installer Kubeflow roles
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build common/kubeflow-roles/base | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Installer ressources Istio pour Kubeflow
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build common/istio-1-17/kubeflow-istio-resources/base | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Vérifier si MySQL existe déjà
+      shell: kubectl get deployment mysql -n kubeflow --ignore-not-found
+      register: mysql_exists
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Supprimer MySQL existant si présent
+      shell: |
+        kubectl delete deployment mysql -n kubeflow --ignore-not-found
+        kubectl delete service mysql -n kubeflow --ignore-not-found
+        kubectl delete pvc mysql-pv-claim -n kubeflow --ignore-not-found
+        sleep 10
+      when: mysql_exists.stdout != ""
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+
+    - name: Installer Dex
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build common/dex/overlays/istio | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Installer OIDC AuthService
+      shell: |
+        cd /opt/kubeflow-manifests
+        if [ -d "common/oidc-authservice/base" ]; then
+          kustomize build common/oidc-authservice/base | kubectl apply -f -
+        elif [ -d "common/oidc-client/oidc-authservice/base" ]; then
+          kustomize build common/oidc-client/oidc-authservice/base | kubectl apply -f -
+        else
+          echo "OIDC AuthService non trouvé, il peut être inclus avec Dex"
+        fi
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+
+    - name: Créer configuration personnalisée pour KF Pipelines
+      copy:
+        dest: /opt/kubeflow-deploy/kf-pipeline-configmap.yaml
+        content: |
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: pipeline-install-config
+            namespace: kubeflow
+          data:
+            defaultPipelineRoot: ""
+            cacheEnabled: "false"
+
+
+    - name: Appliquer configuration pipeline
+      shell: kubectl apply -f /opt/kubeflow-deploy/kf-pipeline-configmap.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Vérifier que tous les nœuds sont Ready
+      shell: kubectl get nodes -o json | jq -r '.items[].status.conditions[] | select(.type=="Ready") | .status' | grep -v True || echo "all_ready"
+
+        
+    - name: Installer Kubeflow Pipelines
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build apps/pipeline/upstream/env/cert-manager/platform-agnostic-multi-user | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+      retries: 3
+      delay: 30
+      ignore_errors: yes
+      
+    - name: Installer KServe (avec retry et préparation)
+      block:
+        - name: Attendre que les webhooks soient prêts
+          shell: |
+            kubectl get validatingwebhookconfigurations -A
+            kubectl get mutatingwebhookconfigurations -A
+          environment:
+            KUBECONFIG: /root/.kube/config
+          
+        - name: Installer KServe - Première tentative
+          shell: |
+            cd /opt/kubeflow-manifests
+            kustomize build contrib/kserve/kserve | kubectl apply -f - || true
+          environment:
+            KUBECONFIG: /root/.kube/config
+            
+        - name: Pause avant deuxième tentative
+          pause:
+            seconds: 30
+            
+        - name: Installer KServe - Deuxième tentative
+          shell: |
+            cd /opt/kubeflow-manifests
+            kustomize build contrib/kserve/kserve | kubectl apply -f -
+          environment:
+            KUBECONFIG: /root/.kube/config
+          retries: 3
+          delay: 30
+        
+    - name: Installer Katib
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build apps/katib/upstream/installs/katib-with-kubeflow | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+        
+    - name: Installer Central Dashboard
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build apps/centraldashboard/upstream/overlays/kserve | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+        
+    - name: Installer Admission Webhook
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build apps/admission-webhook/upstream/overlays/cert-manager | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+        
+    - name: Installer Jupyter Web App
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build apps/jupyter/jupyter-web-app/upstream/overlays/istio | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+        
+    - name: Installer Notebook Controller
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build apps/jupyter/notebook-controller/upstream/overlays/kubeflow | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+        
+    - name: Installer Profiles + KFAM
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build apps/profiles/upstream/overlays/kubeflow | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+        
+    - name: Installer Volumes Web App
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build apps/volumes-web-app/upstream/overlays/istio | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+        
+    - name: Installer Training Operator
+      shell: |
+        cd /opt/kubeflow-manifests
+        kustomize build apps/training-operator/upstream/overlays/kubeflow | kubectl apply -f -
+      environment:
+        KUBECONFIG: /root/.kube/config
+        
+    - name: Configurer utilisateurs Dex
+      shell: |
+        kubectl patch configmap dex -n auth --type merge -p '{"data":{"config.yaml":"issuer: http://dex.auth.svc.cluster.local:5556/dex\nstorage:\n  type: kubernetes\n  config:\n    inCluster: true\nweb:\n  http: 0.0.0.0:5556\nstaticClients:\n- id: kubeflow-oidc-authservice\n  redirectURIs:\n  - /login/oidc\n  name: Dex Login Application\n  secret: pUBnBOY80SnXgjibTYM9ZWNzY2xreNGQok\noauth2:\n  skipApprovalScreen: true\nstaticPasswords:\n- email: admin@kubeflow.org\n  hash: $2y$12$4K/VkmDd1q1Orb3xAt82zu8gk7Ad6ReFR4LCP9UeYE90NLiN9Df72\n  username: admin\n  userID: 08a8684b-db88-4b73-90a9-3cd1661f5466"}}'
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+
+
+    - name: Vérifier l'état final de tous les pods
+      shell: |
+        echo "=== Pods en erreur ou pending ==="
+        kubectl get pods -A | grep -E "Error|CrashLoop|Pending|Init"
+        echo ""
+        echo "=== Events récents ==="
+        kubectl get events -A --sort-by='.lastTimestamp' | tail -20
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: final_status
+      ignore_errors: yes
+      
+    - name: Afficher le statut final
+      debug:
+        var: final_status.stdout_lines
+      
+    - name: Redémarrer Dex
+      shell: kubectl rollout restart deployment dex -n auth
+      environment:
+        KUBECONFIG: /root/.kube/config
+      ignore_errors: yes
+      
+    - name: Attendre stabilisation des pods
+      pause:
+        seconds: 60
+        
+    - name: Vérifier pods Kubeflow
+      shell: kubectl get pods -n kubeflow
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: kf_pods
+      
+    - name: Afficher pods Kubeflow
+      debug:
+        var: kf_pods.stdout_lines
+        
+    - name: Créer script d'accès
+      copy:
+        content: |
+          #!/bin/bash
+          echo "Accès Kubeflow: http://localhost:8080"
+          echo "Email: admin@kubeflow.org"
+          echo "Password: 12341234"Accès
+          kubectl port-forward svc/istio-ingressgateway -n istio-system 8080:80 --address=0.0.0.0
+        dest: /opt/kubeflow-deploy/access-kubeflow.sh
+        mode: '0755'
+        
+    - name: Afficher instructions finales
+      debug:
+        msg:
+          - "Installation terminée!"
+          - "Exécuter: /opt/kubeflow-deploy/access-kubeflow.sh"
+          - "URL: http://localhost:8080"
+          - "Login: admin@kubeflow.org / 12341234"
