@@ -374,4 +374,4 @@ kubectl port-forward svc/istio-ingressgateway -n istio-system 8080:80
 * 📋 Capturer les logs : `kubectl logs -n kubeflow <pod-name> -c istio-proxy`
 * 🙌 Proposer des solutions via Pull Requests
 
-> **Note** : Ce projet est fonctionnel pour Kubernetes mais nécessite encore du travail pour stabiliser complètement Kubeflow. Les contributions sont les bienvenues !
+**Note** : Ce projet est fonctionnel pour Kubernetes mais nécessite encore du travail pour stabiliser complètement Kubeflow. Les contributions sont les bienvenues !
