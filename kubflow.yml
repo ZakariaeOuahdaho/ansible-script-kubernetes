@@ -17,7 +17,6 @@
     - name: Afficher infos système
       debug:
         var: system_info.stdout_lines
-
     - name: Arrêter le cluster Kubernetes existant (pour éviter les conflits)
       shell: |
         systemctl stop kubelet || true
@@ -33,6 +32,7 @@
         name: snapd
         state: present
         update_cache: yes
+
 
     - name: Installer MicroK8s
       snap:
